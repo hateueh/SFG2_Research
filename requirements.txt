@@ -1,0 +1,4 @@
+# Only needed for the extract_*.py scripts and read_pak.py.
+# hubreg.py / hubjoin.py / replay_server.py use only the standard library.
+scapy
+pyuepak

@@ -1,0 +1,1129 @@
+================================================================================
+ WORK.TXT
+ Special Forces Group 2 (SFG2) - Community Server Reverse-Engineering Project
+ Complete technical record: what we did, what we found, and where we stopped
+ Last updated: November 4, 2026
+================================================================================
+
+HOW TO READ THIS DOCUMENT
+-------------------------
+This file is written for engineers joining the project. It is complete on
+purpose: every tool we used, every command that mattered, every address and
+every packet layout we have established. Sections run in chronological order.
+The final section states the primary objective and what the project needs.
+
+CONTENTS
+  1. The game
+  2. Online services and server map
+  3. The people involved (nagoory)
+  4. Phase 0 - Starting point
+  5. Phase 1 - Probing the services from a phone (curl, nmap)
+  6. Phase 2 - Dynamic analysis attempts (Frida, VMOS, Termux, emulators)
+  7. Phase 3 - Static analysis: strings, rabin2, readelf, radare2
+  8. Phase 4 - Ghidra headless decompilation
+  9. Phase 5 - Real-device packet capture: PCAPdroid, tshark
+ 10. Phase 6 - Decoding the host registration protocol (UDP) -> FIRST GOAL
+ 11. Phase 7 - Relay, UE4 handshake, and the join protocol (Python)
+ 12. Phase 8 - Replay server and test results
+ 13. Phase 9 - The .pak file, the AES key, and the config files
+ 14. Where we stopped (observed facts)
+ 15. PRIMARY OBJECTIVE: make the game playable by emulating the server
+
+================================================================================
+ 1. THE GAME
+================================================================================
+Name ............ Special Forces Group 2 (abbreviated SFG2)
+Developer ....... ForgeGames (config: CompanyName=ForgeGames)
+Genre ........... Online multiplayer mobile FPS. Modes include Team Deathmatch,
+                  Capture the Flag, Zombie mode, Bomb defusal, Arms Race.
+Platform ........ Android (UE4 packaged build). Package name:
+                  com.ForgeGames.SpecialForcesGroup2
+Engine .......... Unreal Engine 4.21. Established from the packet/bunch format
+                  analysis (see section 11); the game's own protocol version
+                  string is 4.3 (HTTP header "Version: 4.3", UDP field SV=4.3,
+                  config ProjectVersion=4.3).
+Internal name ... SpecialForcesGroup2 (ProjectName). Content root: SpecialForces
+Distribution .... APKPure XAPK "Special_Forces_Group_2_4.21_APKPure.xapk"
+                  (413 MB). The XAPK contains:
+                    - com.ForgeGames.SpecialForcesGroup2.apk        132 MB
+                    - Android/obb/com.ForgeGames.SpecialForcesGroup2/
+                      main.172.com.ForgeGames.SpecialForcesGroup2.obb
+                      295,148,707 bytes (a zip) containing:
+                        SpecialForces/Content/Paks/
+                          SpecialForces-Android_Multi.pak   294,664,079 bytes
+                        SpecialForces/Content/Movies/UE4_Logo_Portrait.mp4
+                                                            484,628 bytes
+                    - manifest.json, icon.png
+Installed size .. about 420 MB (APK + OBB)
+Native library .. libUE4.so (UE4 engine AND the game module are compiled into
+                  this single shared object; no symbols, stripped).
+                    - arm64-v8a build from the APK (used for all static
+                      analysis in sections 7 and 8)
+                    - armeabi-v7a build, 51,352,896 bytes (strings output:
+                      59,288 lines), obtained later and used in section 13
+Other libs ...... libcurl and OpenSSL are statically linked inside libUE4.so
+                  (no exported SSL_write / curl_easy_* symbols).
+Java layer ...... classes.dex / classes2.dex contain only ad SDKs and Google
+                  services (Unity Ads, Pangle, AdMob, Play Games). No game
+                  networking logic.
+Maps (from pak) . 3000, Afganistan, Assault, AssaultHouse, BigDesert,
+                  BigDesertNew, Bunker, Castle, Desert2, Desert3, Desert4,
+                  Dust, Factory, Fighter, House, Iceworld, Italy, Labirint,
+                  Nuke, Office, Room, Ruins, Ruins2, ShootingRange,
+                  SkinEditorMap, SnowMap, SnowTown, Spaniard, Spaniard2,
+                  Tundra, Versus, West, Winter. Maps loaded by the server use
+                  paths such as /Game/MyContent/Maps/Desert.
+Anti-emulator ... The game refuses to run inside an Android emulator (it shows
+                  a message that it only works on real devices). All dynamic
+                  work therefore uses a real phone for the game and Linux
+                  machines for analysis.
+
+================================================================================
+ 2. ONLINE SERVICES AND SERVER MAP
+================================================================================
+The game talks to several backends. All addresses below were observed in code,
+configuration, or packet captures.
+
+(a) API / account backend
+    sfg2api.forge-games.com  -> 51.91.73.205 (OVH), HTTPS 443, nginx/1.18.0
+    (Ubuntu), certificate from Let's Encrypt (issued Sep 24, 2026).
+    The game opens a TLS session to it repeatedly (28 TLS sessions in one
+    capture, roughly every 30 seconds, ~7.5 KB each). Every path we probed
+    (/, /servers, /list, /api/servers, /api/list, /serverlist, /masterlist)
+    returns the stock nginx 404 page (162 bytes). Firebase Auth traffic
+    (securetoken.googleapis.com) shows the client holds a signed-in account.
+    This service is NOT part of the server-list registration path and we do
+    not use it.
+
+(b) Legacy master server hard-coded in libUE4.so
+    http://85.25.194.37:7500 (stored as UTF-16 text in the library).
+    85.25.194.37 resolves to astra1692.startdedicated.com. Port 7500/tcp is
+    "filtered" (nmap) and curl times out. It is not used by the current game.
+
+(c) Master/hub servers listed in the pak config (DefaultEngine.ini,
+    [/Script/MySettings]):
+        IpMasterMasterServer1=43.249.37.193
+        IpMasterMasterServer2=198.44.48.154
+        IpMasterMasterServer3=85.25.194.37
+        IpMasterMasterServer4=43.249.37.193
+        PortMasterMasterServer=7600
+        DefaultSelectMasterServer=0
+
+(d) JOIN service (TCP, plain HTTP)
+    198.44.48.154:7790 (Hostwinds / HostPapa, USA). When a player taps a
+    server in the list, the game sends an HTTP POST here (details in
+    section 9) and receives the real server address back.
+
+(e) HUB (UDP) - the server list and relay
+    94.26.249.123 (Selectel, Russia), UDP ports 7790-7799.
+    This is the "origin: Russia" region selectable in the game. Hosts register
+    here; the hub returns five relay endpoints that forward player traffic to
+    the host. This is the service our work registers servers in (sections
+    10-12). Registration on the US hub 198.44.48.154 did not make a server
+    appear in the client's list.
+
+(f) A community dedicated server (nagoory) - see section 3:
+    2.56.246.77:17092, room name "nagoory-dedicated".
+
+================================================================================
+ 3. THE PEOPLE INVOLVED
+================================================================================
+nagoory is a community player/administrator who runs a private SFG2 server
+that is listed and playable in the official game. Facts established about it:
+  - The server address seen in the JoinServer response is 2.56.246.77:17092
+    with room link "2.56.246.77:17092/nagoory-dedicated".
+  - It is hosted on a German cloud provider (we identified the provider from
+    packet analysis; nagoory confirmed "German server" when told).
+  - nagoory states the server software is written in C.
+  - It has admin chat commands with a "!" prefix: !kick <player>, mute, ban.
+    A non-admin who tries "!kick <name>" receives "permission denied", so
+    permissions are checked server-side.
+  - According to the project owner, nagoory built this after analyzing the
+    game himself, and he has not shared the details of his work.
+  - Recently nagoory gave the project owner two files and said both are
+    important: the game's .pak file and libUE4.so. He also said he used
+    libUE4.so to obtain the UDP information. Section 13 covers what we found
+    in those files.
+
+The project owner plays on a real Android phone under the in-game name "rain".
+The ForgeGames developers do not answer player messages.
+
+================================================================================
+ 4. PHASE 0 - STARTING POINT
+================================================================================
+The project began with a short research note kept by the project owner. It
+established:
+  - the game ships a stripped libUE4.so,
+  - a hard-coded master server http://85.25.194.37:7500,
+  - an API host sfg2api.forge-games.com,
+  - candidate functions in libUE4.so (radare2 names, arm64 build):
+        0x0101c3ec  parser that handles the server list ("AddServers")
+        0x0101afe4  function that references the format string "http://%s:%s"
+  - nothing proving how a server registers itself or how the list is built.
+The owner had already tried radare2, Frida and an emulator without finding
+the registration code. All of that work was done on a phone (Termux with a
+proot Ubuntu), later moved to GitHub Codespaces (Linux, 2 cores, KVM), and
+finally Google Cloud Shell for the packet work.
+
+================================================================================
+ 5. PHASE 1 - PROBING THE SERVICES FROM A PHONE (curl, nmap)
+================================================================================
+Goal: find out whether the old master server or the API answers anything.
+
+  curl -v --max-time 10 http://85.25.194.37:7500/
+      -> connection timed out after 10002 ms
+  nmap -Pn -p 7500 85.25.194.37
+      -> 7500/tcp filtered (host astra1692.startdedicated.com is up)
+  curl -vk --max-time 10 https://sfg2api.forge-games.com/
+      -> TLS 1.3 handshake OK (TLS_AES_256_GCM_SHA384), HTTP/1.1 404 Not Found,
+         Server: nginx/1.18.0 (Ubuntu), Content-Length: 162
+  for p in servers list api/servers api/list serverlist masterlist; do
+    echo "== /$p"
+    curl -sk -o /dev/null -w "%{http_code} %{size_download}\n" --max-time 10 \
+         "https://sfg2api.forge-games.com/$p"
+  done
+      -> 404 162 for every path
+  (same loop against http://85.25.194.37:7500 -> 000 0, no connection)
+
+Conclusion of the phase: the old master is dead and the API exposes nothing
+discoverable by trial. The real traffic had to be observed, not probed.
+
+================================================================================
+ 6. PHASE 2 - DYNAMIC ANALYSIS ATTEMPTS
+================================================================================
+6.1 Frida
+  A script (sfg2_net.js) was prepared to hook libc connect/send/sendto and
+  getaddrinfo and every SSL_write found in loaded modules, printing a
+  backtrace with module+offset. Core of the script:
+
+    Interceptor.attach(Module.getExportByName("libc.so", "getaddrinfo"), {
+      onEnter(args) { console.log("[dns] " + args[0].readUtf8String()); }
+    });
+    Process.enumerateModules().forEach(m => {
+      const f = m.findExportByName("SSL_write");
+      if (f) { console.log("SSL_write in " + m.name);
+        Interceptor.attach(f, { onEnter(a) {
+          try { console.log(a[1].readUtf8String(Math.min(a[2].toInt32(), 600))); }
+          catch (e) {} } }); }
+    });
+
+  Runner: frida -H 127.0.0.1:27042 -N com.ForgeGames.SpecialForcesGroup2 \
+          -l sfg2_net.js     (frida-server pushed to /data/local/tmp)
+  Result: could not be run against the game on the phone environments tried
+  (see 6.2). Because libcurl/OpenSSL are statically linked inside libUE4.so,
+  hooking by exported name finds nothing there.
+
+6.2 Phone-based environments
+  - VMOS (several versions): unstable, freezes, root hard to enable.
+  - Virtual Master: root worked but the 4 GB phone became unusable; Termux
+    could not reach root files or download bootstrap packages.
+  - proot Ubuntu inside Termux: used for tools (frida-tools, radare2, strings)
+    but could not run the game.
+  All emulators were removed from the phone.
+
+6.3 Android emulator in GitHub Codespaces
+  Setup that worked after fixing a broken symlink (~/.android/avd pointing to
+  /tmp/android_home/avd) and forcing Java 17 for avdmanager:
+
+    export ANDROID_SDK_ROOT=$HOME/android-sdk
+    sdkmanager "platform-tools" "emulator" \
+               "system-images;android-30;google_apis;x86_64"
+    echo no | avdmanager create avd -n sfg \
+         -k "system-images;android-30;google_apis;x86_64" -d pixel_4 --force
+    nohup emulator -avd sfg -no-window -no-audio -no-snapshot \
+          -gpu swiftshader_indirect -memory 3072 > /tmp/emu.log 2>&1 &
+    adb wait-for-device
+    adb install -r com.ForgeGames.SpecialForcesGroup2.apk
+    adb shell mkdir -p /sdcard/Android/obb/com.ForgeGames.SpecialForcesGroup2
+    adb push Android/obb/com.ForgeGames.SpecialForcesGroup2/main.172.*.obb \
+             /sdcard/Android/obb/com.ForgeGames.SpecialForcesGroup2/
+    adb shell monkey -p com.ForgeGames.SpecialForcesGroup2 \
+          -c android.intent.category.LAUNCHER 1
+
+  Result: the game installed, found its OBB and reached the main menu. When
+  the server list was opened it displayed a message saying the game runs only
+  on real devices. The emulator route was closed; the emulator, SDK and
+  system images (about 5 GB) were deleted to free the Codespace disk (the
+  disk had reached 86 percent).
+
+================================================================================
+ 7. PHASE 3 - STATIC ANALYSIS: strings, rabin2, readelf, radare2
+================================================================================
+With the dynamic route closed we returned to the binaries.
+
+7.1 The APK / Java layer
+    unzip -o base.apk -d apk
+    strings -a apk/classes*.dex | grep -iE "forge-games|https?://" | sort -u
+    -> only Google/Unity/Pangle/AdMob URLs. No game endpoints. The Java layer
+       is a wrapper.
+
+7.2 libUE4.so strings (ASCII)
+    strings -a apk/lib/arm64-v8a/libUE4.so | grep -n -B8 -A12 "JoinServer"
+  This printed a block of Unreal reflection names (UFunction and property
+  names of the game's own classes). Relevant members, in table order:
+    functions : JoinServerNew, RegisterServer, GetUniqueID, GotPuInfo,
+                GotReadPuInfo, HasAd, LoadAd, LoadMenuAd, LoadSaveGameBP,
+                MenuAdBlocked, NewVersion, SavePasswords, SaveUserColors,
+                SetAllDeadsBots, SetAllDeadsPlayers, SetAllKillsBots,
+                SetAllKillsPlayers, GetSfg3Link, GetScoreKills, GetScoreSniper
+    variables : numSelectMasterServer, LastJoinServer, MyMsg, InternetServers,
+                MasterServers, _GameMode, bEndPingTest, iPing, CountPing,
+                MaxPing, PublicServer, DefaultSelectMasterServer, BombAllMaps
+  Meaning: the client has a master-server selection (number + default value in
+  the pak), a ping test, an InternetServers array, and a RegisterServer
+  function used when a player creates a server.
+
+7.3 libUE4.so strings (UTF-16)
+    strings -a -el apk/lib/arm64-v8a/libUE4.so | grep -iE "respond|regist|master|server"
+  UE4 stores UI text as UTF-16, in 16-byte chunks that overlap their
+  neighbours, so strings show fragments. Reassembled, the chunk pool at
+  file offset 0x033c6000-0x033c6200 contains, in order:
+    GetListMasterServer ... http://85.25.194.37:7500 ... GameMastrverName
+    ListMasterServer ... SERVER DOES NOT RESPOND ... MaxPing= CountPin
+    AddServe GetServe GetAllServers GetPasswords ... Classic ...
+    RegistrationServerWhite~_Data_= ... RegistrationServerHub~_Data_= ...
+    ERROR PING NOT RESPOND ... ;!Pass= ... Login ... CopyToClipboard
+  Python used to read the UTF-16 neighbours of a known string:
+    data = open("apk/lib/arm64-v8a/libUE4.so","rb").read()
+    key = "http://85.25.194.37:7500".encode("utf-16-le")
+    i = data.find(key)              # 0x33c6070
+    print(data[i-160:i+640].decode("utf-16-le", errors="replace"))
+  This is how the message format "_Function_=...~_Data_=..." and the command
+  names (GetListMasterServer, AddServers, GetServers, GetAllServers,
+  GetPasswords, RegistrationServerWhite, RegistrationServerHub, JoinServer)
+  first appeared.
+
+7.4 Finding the real native function behind RegisterServer
+  UE4 registers native UFunctions in a table of (name pointer, function
+  pointer) pairs that is filled by relocations at load time, so a plain
+  xref search finds nothing. We read the relocations directly:
+
+    LIB=apk/lib/arm64-v8a/libUE4.so
+    NAME=RegisterServer
+    V=$(rabin2 -z $LIB | awk -v n="$NAME" '$NF==n {print $3; exit}')
+    A=$(printf '%x' $((V)))
+    readelf -rW $LIB > /tmp/rela.txt
+    SLOT=$(grep -E "R_AARCH64_RELATIVE +$A\$" /tmp/rela.txt | head -1 | awk '{print $1}')
+    echo "string=$V slot=$SLOT"
+    NEXT=$(printf '%016x' $((0x$SLOT + 8)))
+    grep -E "^$NEXT " /tmp/rela.txt
+
+  Output:  string=0x033ce40b  slot=00000000041f6780
+           00000000041f6788  R_AARCH64_RELATIVE  10a4844
+  So the native thunk for RegisterServer is at 0x10a4844. radare2 commands:
+
+    r2 -q -e bin.cache=true -c "s 0x10a4844; af; pdr" apk/lib/arm64-v8a/libUE4.so
+    r2 -q -e bin.cache=true -c "s 0x101e550; af; pdr" apk/lib/arm64-v8a/libUE4.so > register_impl.txt
+    r2 -q -e bin.cache=true -c "s 0x101afe4; af; pdr" apk/lib/arm64-v8a/libUE4.so > url_builder.txt
+    r2 -q -e bin.cache=true -c "psw 0x20 @ 0x33c6200; psw 0x20 @ 0x33c6210" apk/lib/arm64-v8a/libUE4.so
+    (bin.cache=true is required so relocations are applied; pdr is used
+     because pdf complains about non-linear functions)
+
+  Findings:
+    0x010a4844  thunk of RegisterServer; calls 0x0101e550.
+    0x0101e550  routine that reads clock_gettime, runs about every 10 seconds,
+                calls 0x0101afe4 with [this+0x558] and 1, and shows the UTF-16
+                message "ERROR PING NOT RESPOND" for 10 seconds when no answer
+                arrives. This is the periodic server ping/availability check.
+    0x0101afe4  function that takes (object, index, flag) and reads an element
+                of an array of 88-byte records with text at offset 0x20 (the
+                InternetServers entries); it references "http://%s:%s".
+
+================================================================================
+ 8. PHASE 4 - GHIDRA HEADLESS DECOMPILATION
+================================================================================
+To read the list parser and the message handler as C-like code we moved to
+Ghidra 11.3.2 in headless mode (no GUI, Codespaces with 10 GB heap):
+
+    sudo apt-get install -y openjdk-21-jdk-headless unzip wget
+    export JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64
+    cd ~ && wget https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_11.3.2_build/ghidra_11.3.2_PUBLIC_20250415.zip
+    unzip -q ghidra_11.3.2_PUBLIC_20250415.zip && mv ghidra_11.3.2_PUBLIC ~/ghidra
+    unzip -o com.ForgeGames.SpecialForcesGroup2.apk 'lib/arm64-v8a/libUE4.so' -d apk
+    sed -i '/^MAXMEM=/d' ~/ghidra/support/launch.properties
+    echo 'MAXMEM=10G' >> ~/ghidra/support/launch.properties
+    mkdir -p ~/ghproj
+    nohup ~/ghidra/support/analyzeHeadless ~/ghproj sfg2 \
+        -import apk/lib/arm64-v8a/libUE4.so -noanalysis > /tmp/import.log 2>&1 &
+
+  (The first import failed because the .so was not at the given path; after
+  extracting it again the import succeeded.)
+
+  Decompile script (~/gscripts/DecompAt.py):
+
+    from ghidra.app.decompiler import DecompInterface
+    from ghidra.util.task import ConsoleTaskMonitor
+    base = currentProgram.getImageBase().getOffset()
+    print("image base: 0x%x" % base)
+    ifc = DecompInterface(); ifc.openProgram(currentProgram)
+    for a in getScriptArgs():
+        addr = toAddr(int(a, 16) + base)
+        f = getFunctionContaining(addr)
+        if f is None:
+            disassemble(addr); f = createFunction(addr, None)
+        if f is None:
+            print("no function at %s" % a); continue
+        r = ifc.decompileFunction(f, 120, ConsoleTaskMonitor())
+        print("=== %s @ %s ===" % (f.getName(), f.getEntryPoint()))
+        print(r.getDecompiledFunction().getC() if r.decompileCompleted()
+              else "decompile failed: %s" % r.getErrorMessage())
+
+  Run:
+    ~/ghidra/support/analyzeHeadless ~/ghproj sfg2 -process libUE4.so \
+        -noanalysis -scriptPath ~/gscripts -postScript DecompAt.py \
+        101c3ec 101b60c > /tmp/decomp.txt 2>&1
+
+  KEY FACT: Ghidra's image base is 0x100000, so
+        Ghidra address = radare2 address + 0x100000
+        (0x101c3ec in r2 is FUN_0111c3ec in Ghidra).
+
+  A second script (StrRefs2.py) listed every string referenced by the two
+  functions (it had to read UE4's split 16-byte chunks and constants built
+  from movz/movk instructions). Results:
+
+    FUN_0111c3ec (r2 0x101c3ec)  "AddServers" handler
+        splits the text on '~' (literal at 0x034fdcf8) with the UE4 helper at
+        0x0122d5dc (ParseIntoArray-style), then loops over the pieces.
+        Touches the key fragments MaxPing=, CountPing, AddServers, GetServers,
+        GetAllServers.
+    FUN_0111b60c (r2 0x101b60c)  hub-reply message handler
+        splits on ';' (literal at 0x035ffc1a), compares the function field to
+        "JoinServer" (literal at 0x034ce6d7) and the status to "OK"
+        (0x03788b91) or "ERROR" (0x036d1ddb).
+
+  This confirmed that the game's client protocol is a text protocol of the form
+        _Function_=<Name>;_MSG_=<payload>;...      (replies)
+        _Function_=<Name>~_Data_=<key=value;...>~  (requests)
+  A full Ghidra auto-analysis script (RunAnalysis.py with a progress monitor)
+  was written but cancelled once the packet captures in section 9 produced the
+  registration protocol directly.
+
+================================================================================
+ 9. PHASE 5 - REAL-DEVICE PACKET CAPTURE (PCAPdroid + tshark)
+================================================================================
+Because the emulator was refused, we captured traffic on the real phone.
+Tool: PCAPdroid (a local-VPN capture app). It was set to capture only
+com.ForgeGames.SpecialForcesGroup2; the phone's local VPN address shows up as
+10.215.173.1 in every capture. The .pcap files were uploaded to the Linux
+machine (Codespaces, later Google Cloud Shell) and analyzed with tshark.
+
+Installing tshark (note: on Cloud Shell anything installed with apt is lost
+when the VM is recycled; put the install in ~/.customize_environment or
+reinstall):
+    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y tshark
+
+9.1 First capture: normal play (game.pcap)
+    tshark -r game.pcap -Y "tls.handshake.extensions_server_name" \
+           -T fields -e tls.handshake.extensions_server_name | sort | uniq -c | sort -rn
+      28 sfg2api.forge-games.com
+       7 googleads.g.doubleclick.net      (the rest: Unity Ads, Pangle, Google)
+    tshark -r game.pcap -Y "http.request" -T fields \
+           -e ip.dst -e http.host -e http.request.method -e http.request.uri | sort -u
+      198.44.48.154   198.44.48.154:7790   POST   /
+
+    Following that one TCP stream:
+      S=$(tshark -r game.pcap -Y "http.request && ip.dst==198.44.48.154" \
+          -T fields -e tcp.stream | head -1)
+      tshark -r game.pcap -q -z follow,tcp,ascii,$S
+
+    Request (257 bytes, plain HTTP, no TLS):
+      POST / HTTP/1.1
+      Host: 198.44.48.154:7790
+      Accept: */*
+      Accept-Encoding: deflate, gzip
+      User-Agent: SpecialForcesGroup2
+      Version: 4.3
+      Content-Type: application/json
+      _Function_: JoinServer
+      Content-Length: 0
+      _Data_: 2.56.246.77:17092/nagoory-dedicated
+    Reply (122 bytes, 0.2 s later):
+      _Function_=JoinServer;_MSG_=2.56.246.77:17092;_RoomLink_=2.56.246.77:17092/nagoory-dedicated;!Pass=;;
+
+    So the JOIN step is: command name in the _Function_ header, argument in
+    _Data_, reply is "key=value;key=value;;" text. The same "_Function_ /
+    _Data_" naming had already been seen as strings in libUE4.so.
+    whois: 198.44.48.154 = Hostwinds/HostPapa (US); 51.91.73.205 (API) = OVH;
+    2.56.246.77 = nagoory's dedicated server (German cloud).
+    The captured game never contacted 85.25.194.37 (legacy master).
+
+9.2 Second capture: the owner hosting a server from the phone (rain_host.pcap)
+    The owner pressed "create server" inside the game and let another device
+    join. An HTTP filter on this capture returned nothing, so registration is
+    not HTTP. Looking at conversations:
+      tshark -r rain_host.pcap -q -z conv,udp
+      tshark -r rain_host.pcap -Y 'ip.addr==94.26.249.123' -T fields \
+             -e ip.src -e udp.srcport -e ip.dst -e udp.dstport -e udp.length
+    The phone (UDP source port 7777, the UE4 default) exchanges small UDP
+    packets with 94.26.249.123 on ports 7790-7799, and a second flow
+    (relay ports 58168-58172 in that capture) carries the other player's
+    game traffic to the phone's port 7777. whois: SELECTEL-NET, RU.
+
+================================================================================
+ 10. PHASE 6 - DECODING THE HOST REGISTRATION PROTOCOL  -> FIRST GOAL
+================================================================================
+10.1 The registration dialogue (all plain text UDP, no token, no encryption)
+    Step 1 - Ping (measured by the game as the ping to each hub port):
+        host -> hub port (7790..7799):  "Ping"   (50 69 6e 67)
+        hub -> host (same port):        "Ping"   about 0.11-0.18 s later
+        host -> hub:                    0x07     (one byte) after the echo
+    Step 2 - Registration, repeated about every 20 seconds, sent to 2-3 of
+    the ten hub ports each time, followed by 4 zero bytes:
+        _Function_=RegistrationServerHub~_Data_=Po=7777;SV=4.3;SN=rain;M=Desert;CP=1;MP=6;GM=CaptureTheFlag(0);Pa=;~
+      Field meaning (from the values seen):
+        Po  game port (7777)          SV  protocol/game version (4.3)
+        SN  server name               M   map
+        CP  current players           MP  max players
+        GM  game mode                 Pa  password (empty = none)
+    Step 3 - Hub reply (OKRegisterHub), contains FIVE relay endpoints:
+        _Function_=OKRegisterHub;_MSG_=<ip:port>~<ip:port>~<ip:port>~<ip:port>~<ip:port>;_RoomLink_=<host public IP>:7777/<name>;!Pass=<password>;;
+      In the capture: 19 registration messages were sent and 7 OKRegisterHub
+      replies came back (the hub does not answer every message).
+    Step 4 - Opening the relays: the host sends the 9-byte text "IamServer"
+      3 to 5 times to every relay endpoint; each relay answers "OK" (4f 4b).
+      Afterwards the host sends "test" (74 65 73 74) three times.
+      Every ~50 s each relay sends a 3-byte all-zero packet (keep-alive).
+    Step 5 - Player traffic: from then on, packets from joining players arrive
+      from the hub's relay ports (58xxx range) to the host's port 7777, and
+      the host replies to the same relay port.
+    The host only ever talks outward from port 7777. Our servers run on
+    Google Cloud Shell (behind NAT, no forwarded ports) and receive the relay
+    traffic normally.
+
+10.2 The UE4 stateless handshake that follows (decoded by hand)
+    The relay packets are standard UE4 traffic with no encryption. First four
+    packets of a connection (rain_host.pcap frames 2329-2334):
+        2329 client -> host  25 bytes  "01 00 00 ..."  all zero: start request
+        2331 host -> client  25 bytes  challenge (timestamp + 20-byte cookie)
+        2333 client -> host  25 bytes  same bytes echoed back
+        2334 host -> client  25 bytes  ack (timestamp field = -1.0)
+    Decoder used (bit order LSB first):
+
+        import struct
+        def dec(h):
+            d = bytes.fromhex(h); pos = [0]
+            def take(n):
+                v = 0
+                for i in range(n):
+                    b = pos[0]
+                    v |= ((d[b >> 3] >> (b & 7)) & 1) << i
+                    pos[0] += 1
+                return v
+            hs, rs, sid = take(1), take(1), take(1)
+            ts = struct.unpack('<f', take(32).to_bytes(4, 'little'))[0]
+            ck = take(160).to_bytes(20, 'little').hex()
+            return hs, rs, sid, round(ts, 3), ck
+
+    Results:  2329 -> (1,0,0, 0.0,    0000...)          start
+              2331 -> (1,0,1, 243.952, fc9683...874c)    challenge
+              2333 -> (1,0,1, 243.952, fc9683...874c)    echo
+              2334 -> (1,0,1, -1.0,    fc9683...874c)    ack
+    The 32-bit float is the host's uptime in seconds (243.952 s, consistent
+    with the first Ping of the capture); -1.0 marks the acknowledgement.
+
+10.3 Game packets after the handshake (decoded from the same capture)
+    Message types observed: Hello (0), Welcome (1), Challenge (3), Netspeed
+    (4), Login (5), Join (9).
+      frame 2335 player -> host  Hello       (27 bytes)
+      frame 2336 host -> player  Challenge   text "165927E0" (8 chars)
+      frame 2324 player -> host  Login       carries the URL
+         /Game/MyContent/MapsNotPlay/MainMenu?Name=localhost-<32 hex GUID>
+         and the player id "localhost-<GUID>", platform "GooglePlay"
+      frame 2326 host -> player  Welcome     map /Game/MyContent/Maps/Desert,
+         game mode class /Game/MyContent/BP/GameModeBP.GameModeBP_C
+    After Welcome the real host sent 6 large packets (389, 1025, 417, 540,
+    1018, 233 bytes) within 42 ms, then a steady stream of small packets.
+    Session statistics: 130 seconds, 3463 packets, 209 KB.
+
+10.4 FIRST GOAL ACHIEVED: a server we registered appeared in the game's list
+    hubreg.py - our first script. It binds UDP 7777 (like the game, because
+    the hub answers to the sending port), pings three random hub ports, and
+    registers every 20 seconds:
+
+        import socket, sys, time, random, select
+        HUB = "94.26.249.123"
+        PORTS = list(range(7790, 7800))
+        name = sys.argv[1] if len(sys.argv) > 1 else "TEST-not-joinable"
+        minutes = min(float(sys.argv[2]) if len(sys.argv) > 2 else 3, 5)
+        password = sys.argv[3] if len(sys.argv) > 3 else ""
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.bind(("0.0.0.0", 7777)); s.setblocking(False)
+        oks = 0
+        def recv_all(wait):
+            end = time.time() + wait; got = []
+            while time.time() < end:
+                r, _, _ = select.select([s], [], [], max(0, end - time.time()))
+                if not r: break
+                got.append(s.recvfrom(2048))
+            return got
+        def ping(port):
+            s.sendto(b"Ping", (HUB, port))
+            if any(d == b"Ping" and a[1] == port for d, a in recv_all(1.0)):
+                s.sendto(b"\x07", (HUB, port))
+        def register(port):
+            global oks
+            msg = ("_Function_=RegistrationServerHub~_Data_="
+                   "Po=7777;SV=4.3;SN=%s;M=Desert;CP=0;MP=6;GM=CaptureTheFlag(0);Pa=%s;~"
+                   % (name, password)).encode() + b"\x00" * 4
+            s.sendto(msg, (HUB, port))
+            for data, addr in recv_all(1.5):
+                if b"OKRegisterHub" in data: oks += 1
+        end = time.time() + minutes * 60
+        while time.time() < end:
+            t0 = time.time(); ports = random.sample(PORTS, 3)
+            for p in ports: ping(p)
+            for p in ports: register(p)
+            time.sleep(max(0, 20 - (time.time() - t0)))
+        print("stopped, OKRegisterHub replies:", oks)
+
+    Run: python3 -u ~/hubreg.py TEST-not-joinable 5 7351
+    On the real phone: choose origin "Russia" in the game and search the
+    server list.
+    OBSERVED FACT: the game does not show password-protected servers in the
+    normal list; entering the password (7351) in the game's password search
+    box made "TEST-not-joinable" appear. The server written by us was listed
+    in the in-game server list. Later tests used an empty password (Pa=),
+    because registering with a password caused problems in the game.
+
+    hubreg.py was a pure registration test. The next script (hubjoin.py,
+    section 11) also receives the relay traffic.
+
+================================================================================
+ 11. PHASE 7 - RELAY, UE4 HANDSHAKE AND THE JOIN PROTOCOL (Python)
+================================================================================
+Script family: hubjoin.py -> hubjoin12.py (patch chain), then
+hubjoin_test1/2/5.py (in the working folder). All are single-file Python 3
+programs using only the standard library. They bind UDP 7777, talk to the
+hub, and run a small UE4 server state machine on the relay traffic.
+
+11.1 Hub side (what the script does)
+    - ping three random hub ports, send the RegistrationServerHub message
+      (section 10) every 20 s;
+    - parse OKRegisterHub, read the five relay endpoints from _MSG_ (split on
+      '~', each "ip:port");
+    - send "IamServer" 3 times to every relay, and then re-send "IamServer" to
+      every relay every 10 seconds. This repeat is required: when the periodic
+      keep-alive was the word "test", only 2 of 5 relays answered "OK";
+      with the repeated "IamServer" all 5 answer "OK" every time;
+    - answer hub "Ping" with 0x07;
+    - ignore relay "OK" and 3-byte all-zero keep-alives; everything else is
+      a player packet and goes to the UE4 layer.
+    Each join attempt arrives on one relay port; the game may try more than
+    one relay for a single tap on "join". One registration lasts the chosen
+    time (4-5 minutes in our tests) and gives five relay ports.
+
+11.2 Stateless handshake implemented on the server (works)
+        def handshake_packet(sid, ts, cookie):        # 25 bytes
+            bits = []
+            put(bits, 1, 1); put(bits, 0, 1); put(bits, sid, 1)
+            put(bits, int.from_bytes(struct.pack("<f", ts), "little"), 32)
+            put(bits, int.from_bytes(cookie, "little"), 160)
+            bits.append(1)                              # terminator
+            return bits_to_bytes(bits)
+        # on the client's all-zero start packet (ts==0.0, cookie all zero):
+        #     cookie = os.urandom(20); send handshake_packet(1, uptime, cookie)
+        # on the echoed packet with the same cookie:
+        #     send handshake_packet(1, -1.0, cookie)       # ack
+    FACT: the initial packet sequence numbers are carried in the cookie
+    itself. In three real handshakes the 14-bit server initial sequence sits
+    at bit 35 and the 14-bit client initial sequence at bit 51 of the 25-byte
+    packet. Our server sends a random cookie, so the sequence numbers are
+    arbitrary; the server learns its own initial sequence from the "ack"
+    field of the client's first game packet (see 11.3).
+
+11.3 Game packet layout (UE4.21, no encryption) - bit 0 is the least
+     significant bit of the first byte
+        bit 0          handshake flag (0 for game packets)
+        bits 1-4       history word count minus one (hwc-1)
+        bits 5-18      AckedSeq (14 bits)
+        bits 19-32     Seq (14 bits)
+        bits 33..      hwc history words, 32 bits each (bit i of a word means
+                       packet number (AckedSeq-1-i) was received)
+        then           body, starting at bit 33 + 32*hwc
+        last bit       a terminating 1 (body_len here includes it, so the
+                       last bunch ends at body_len-1)
+    Functions used (verified against every captured packet):
+
+        def parse_conn(data):
+            v = int.from_bytes(data, "little")
+            if v == 0 or (v & 1): return None
+            t = v.bit_length() - 1
+            hwc = ((v >> 1) & 0xF) + 1
+            ack = (v >> 5) & 0x3FFF
+            seq = (v >> 19) & 0x3FFF
+            start = 33 + 32 * hwc
+            if t < start: return None
+            body_len = t - start
+            body = (v >> start) & ((1 << body_len) - 1)
+            return dict(seq=seq, ack=ack, body_len=body_len, body=body)
+
+        def build_conn(seq, ack, words, body, body_len):
+            v = (len(words) - 1) << 1
+            v |= ack << 5
+            v |= seq << 19
+            pos = 33
+            for w in words:
+                v |= w << pos; pos += 32
+            v |= body << pos; pos += body_len
+            v |= 1 << pos; pos += 1
+            return v.to_bytes((pos + 7) // 8, "little")
+
+        def send_conn(port, st, body, body_len, label):
+            seen = st["seen"]; ack = max(seen); hist = 0
+            for i in range(32):
+                if (ack - 1 - i) in seen: hist |= 1 << i
+            pkt = build_conn(st["next_seq"], ack, [hist], body, body_len)
+            s.sendto(pkt, (HUB, port))
+            st["next_seq"] = (st["next_seq"] + 1) & 0x3FFF
+
+11.4 Bunch header layout (UE4.21), read from the start of the body
+        bits 0-8       packet-level fields (9 bits in all hand-analyzed
+                       packets)
+        then per bunch:
+          bControl (1)
+            if bControl: bOpen (1), bClose (1); if bClose: CloseReason (4)
+          bIsReplicationPaused (1)
+          bReliable (1)
+          ChIndex          packed int: 8 bits per byte, bit 0 = "more bytes"
+          bHasPackageMapExports (1), bHasMustBeMappedGUIDs (1), bPartial (1)
+          if bReliable:  ChSequence (10 bits)
+          if bPartial:   bPartialInitial (1), bPartialFinal (1)
+          if bReliable or bOpen:  channel name field
+                                  17 bits for the control channel (Hello,
+                                  Challenge, Welcome, Login) and 9 bits for
+                                  the opened actor channels
+          BunchDataBits (13 bits)
+          data
+        The next bunch starts right after the data; after the last bunch comes
+        the terminating 1 bit. FName ids (from the analysis notes): Actor=#102,
+        Control=#255, Voice=#256.
+    ChSequence field position inside the body:
+        Hello (bOpen=1): bits 25-34
+        Challenge / Welcome (reliable, not open): bits 23-32
+    A back-tracking parser (tries name width 9 then 17 for each reliable or
+    open bunch and requires the whole packet to be consumed exactly) decodes
+    Hello, Challenge, Welcome, the first 17 replay packets and 81 of 81 large
+    packets taken from live-test captures.
+
+11.5 THE CHSEQUENCE RULE (the key discovery that made the join work)
+    Every channel of a connection starts its reliable sequence from the same
+    base:   base = (initial packet sequence number of that side) mod 1024
+    and the first reliable bunch on ANY channel carries base + 1.
+      - Player: Hello.ChSequence = (player's first packet seq mod 1024) + 1
+        (12 of 12 sessions).
+      - Server: Challenge.ChSequence = (server initial seq mod 1024) + 1
+        (6 of 6 real sessions). Welcome = base + 2 on channel 0.
+      - Example (session 61048): server initial seq 10197 -> base 981 -> the
+        first reliable bunch on channels 0, 2, 3, 8 and 11 carries 982.
+      - The player's own control-channel counter after Hello (base b+1):
+        Login b+2, Netspeed b+3, Join b+4, and a Close bunch uses b+5
+        (e.g. 878, 879, 880, 881, 882).
+    Wrong values are not accepted: the client buffers or discards the bunch
+    and the connection never advances. Earlier versions of our server wrote
+    ChSequence=1 at bits 25-34 of the Challenge; that value was both wrong and
+    in the wrong place, and every test before the fix ended with the player
+    closing the connection a fraction of a second after the Challenge.
+
+11.6 Server state machine (works through Welcome, in hubjoin_test*.py)
+        H1_BODY = 0x8018229b991c9a9b18800000048181c00bff7e800800   # Challenge, 176 bits
+        H1_LEN  = 176
+        W_BODY  = <captured Welcome body, 736 bits>              # in the script
+        W_LEN   = 736
+        ACK_BODY, ACK_LEN = 0x200, 10                            # empty ack packet
+
+        def set_chseq(body, chseq):
+            mask = ((1 << 10) - 1) << 23
+            return (body & ~mask) | ((chseq & 0x3FF) << 23)
+
+        def on_conn_packet(data, port):
+            c = parse_conn(data)
+            st = conns.setdefault(port, dict(seen=set(), next_seq=None, stage=0, t=0.0))
+            if st["next_seq"] is None:
+                st["next_seq"] = (c["ack"] + 1) & 0x3FFF
+                st["base"] = st["next_seq"]                  # server initial seq
+            st["seen"].add(c["seq"])
+            n = len(data)
+            if st["stage"] == 0 and n == 27:                  # Hello
+                send_conn(port, st, set_chseq(H1_BODY, (st["base"] & 1023) + 1), H1_LEN, "Challenge")
+                st["stage"] = 1
+            elif st["stage"] == 1 and n > 100:                # Login
+                send_conn(port, st, set_chseq(W_BODY, (st["base"] & 1023) + 2), W_LEN, "Welcome")
+                send_conn(port, st, ACK_BODY, ACK_LEN, "ack")
+                st["stage"] = 2
+            elif n > 10:
+                send_conn(port, st, ACK_BODY, ACK_LEN, "ack")  # never answer a 10-byte ack
+
+    Measured packet sizes on the wire: Hello 27 bytes, Challenge 31, Login
+    176-193 (it carries a retransmitted Hello), Welcome 101, Netspeed 22 (value
+    100000 = ConfiguredInternetSpeed), Join 18 (sometimes Netspeed+Join in
+    one 29-byte packet), empty ack 10 (ours 9).
+
+    Join order: the real host answers the Join within 9 ms with the first
+    state burst. In the run where our replay started on the Netspeed packet,
+    before the Join arrived, the client closed the connection right after
+    sending the Join; later runs start the replay on the Join.
+
+    Client close: a 17-byte packet (34 bytes when it also carries a
+    retransmitted Hello) ending in ff 05 00 c0 is a Close bunch on channel 0
+    (bControl=1, bOpen=0, bClose=1, CloseReason=0, reliable, ChIndex 0, no
+    data). That is the client leaving the match.
+
+================================================================================
+ 12. PHASE 8 - REPLAY SERVER AND TEST RESULTS
+================================================================================
+Since the server has no game logic, the first attempt to keep a player in the
+match replays what a real host sent to a real client.
+
+12.1 Source data
+    rain_play.pcap: capture of the owner's phone while hosting (host
+    10.215.173.1:7777, relay IP 94.26.249.123). It contains four real client
+    sessions on relay ports 61047-61050. Session 61048 is the one replayed:
+    Welcome at t = 60.080645 s; the host's first reply to the Join is 9 ms
+    after the Join; client replies on channel 2 follow about 0.34 s later.
+
+12.2 What the replay does
+    - loads every host->client packet of session 61048 after the Welcome
+      (3121 packets when only 10-byte acks are skipped; 1820 when sizes
+      10/32/33 and voice packets containing 0a31 are skipped too);
+    - starts the replay when the client's Join arrives (packet of 18 or 29
+      bytes) and keeps the original timing, first packet 9 ms after the Join;
+    - rewrites the player GUIDs inside the bodies (the capture contains the
+      joining client's GUID 00036D3A08DF2C39EF21CD4C3C083385 and the host's
+      GUID 00030EA508DF3037159F9A16D5BD9326, each also as the 10-character
+      tag "localhost-<first 10 hex>"). The new player's GUID is read from the
+      Login ("localhost-<32 hex>") and substituted;
+    - shifts every reliable ChSequence by  d = ((base & 1023) - 981) & 1023
+      (981 = 10197 mod 1024, the base of the captured session), using the
+      parser of 11.4 to find each ChSequence bit position:
+
+        def rebase_body(body, blen, st):
+            pos = positions_of_reliable_chseq(body, blen)   # back-tracking parser
+            d = ((st["base"] & 1023) - 981) & 1023
+            for p in pos:
+                o = (body >> p) & 1023
+                body = (body & ~(1023 << p)) | (((o + d) & 1023) << p)
+            return body
+
+    - stops the replay as soon as a Close bunch (ending ff0500c0) arrives.
+
+12.3 Test log (every run used a new server name, no password, 4-5 minutes,
+     hub 94.26.249.123, one join per run)
+    Run        Change                                     Result
+    joinable2  empty ack to any packet                    no player packets seen
+    joinable3  IamServer repeated to relays               all 5 relays OK;
+                                                          Hello -> Challenge ->
+                                                          client closes (bad chseq)
+    joinable4  log every packet                           same
+    joinable5  Challenge ChSequence = (base&1023)+1 at    Login (193 B) arrives,
+               bits 23-32                                 Welcome sent, map appears
+                                                          for an instant, client sends
+                                                          Netspeed+Join, then leaves
+    joinable6  replay of first 17 packets, no rebase      client acks all, sends nothing
+                                                          big, leaves after ~3 s
+    joinable7  rebased replay (started on Netspeed)       client closes right after Join
+    joinable8  replay started on Join                     one attempt: acks first 4
+                                                          packets then silence; another:
+                                                          close before Welcome arrived
+    rain7      full replay, rebase, Join trigger,         SERVER APPEARED, JOIN WORKED:
+               close detection (hubjoin_test2.py)         whole map loaded, team
+                                                          selection (CT) shown, a
+                                                          character named "rain" walks,
+                                                          the player list shows players
+                                                          that are not there, chat shows
+                                                          two join messages; client
+                                                          closes after 4.8-6.8 s
+    rain11     no skip filters except 10-byte acks        same, closes after 4.0-6.3 s
+    US hub     198.44.48.154                              server did not appear in list
+    The players, names and the walking character come from the recorded
+    session; nothing on the screen is live.
+
+12.4 Files
+    ~/rain_host.pcap, ~/rain_play.pcap, game.pcap       captures
+    hubreg.py                registration only
+    hubjoin.py .. hubjoin12.py   patch chain (patch5..patch10 in the history)
+    hubjoin_test1.py         replay server with GUID patching
+    hubjoin_test2.py         + ChSequence rebase, Join trigger, close detection
+    hubjoin_test5.py         test2 with only 10-byte acks skipped
+    replay.json / replay2.json   17-packet extraction used in early tests
+    review.txt               notes from the second analysis agent
+    run:  cd ~/test_state_analysis && HUB=94.26.249.123 nohup python3 -u \
+          hubjoin_test5.py <new-name> 5 none > server_<new-name>.log 2>&1 &
+    check: grep -n "Welcome\|scheduled\|CLIENT CLOSED" server_<new-name>.log
+
+================================================================================
+ 13. PHASE 9 - THE .PAK FILE, THE AES KEY AND THE CONFIG FILES
+================================================================================
+13.1 How we got the files
+    nagoory gave the project owner two files and called both important: the
+    game's .pak and libUE4.so (the armeabi-v7a build, 51,352,896 bytes,
+    stored at ~/extractedApk/lib/armeabi-v7a/libUE4.so). The pak is the one
+    inside the OBB:
+        obb_extracted/SpecialForces/Content/Paks/SpecialForces-Android_Multi.pak
+    (294,664,079 bytes). The pak is AES-256 encrypted; earlier attempts with
+    "strings" on it returned nothing readable because of that.
+
+13.2 The AES key
+    The 32-byte AES-256 key was found on a public website. With it the pak
+    opens using the Python package pyuepak:
+
+        from pyuepak import PakFile
+        pak = PakFile()
+        pak.key = bytes.fromhex("<32-byte AES-256 key, hex>")
+        pak.read(r"obb_extracted/SpecialForces/Content/Paks/SpecialForces-Android_Multi.pak")
+        files = pak.list_files()          # works; the index decrypts
+        data  = pak.read_file(files[0])   # read one file
+
+    (The key itself is kept in the owner's scripts find.py and
+    foldersFinderPak.py.)
+
+13.3 What the pak contains
+    439 folders. Engine part: Engine/Config (24 .ini files in total), engine
+    content (materials, fonts, icu data, slate resources), and plugin folders
+    OnlineSubsystem, OnlineSubsystemGooglePlay, OnlineSubsystemNull,
+    OnlineSubsystemUtils, Firebase, UltimateMobileKit, UniversalMobileAds,
+    gameDNAinstaller, MultiDex, AndroidPermission, AudioCapture,
+    SignificanceManager and others. Game part: SpecialForces/Config and
+    SpecialForces/Content/MyContent with BP (Localization, MainMenu, Specnaz,
+    Terror, Zombie, Decal, Explosion, Fire, Flash, Impact, MuzzleFlash, Shell,
+    Smoke, Sky), HUD (NewUI, SkinEditor, Widgets, Crosshairs), Man
+    (character animation, death, shield, Girl, DedMoroz, Zombie), Maps,
+    MapsNotPlay, MapsObject (all the map folders listed in section 1), Menu,
+    Objects (Flags, Ladders), SkinsWeapon (PBR skins for AK12, AK47, AK74,
+    AUG, AWP, Anaconda, Bizon, DE, FAMAS, G36c, Glock, HK416, Karambit, M16,
+    M249, M4A1, M82, MP5, MP7A1, P90, SVD, Scout, Spas12, UMP45, USP, VAL and
+    more), Sounds, Weapons (1p/3p models for every weapon).
+    CONTENT TYPE: cooked Unreal assets only (.uasset / .uexp / .ubulk:
+    Blueprints, materials, textures, meshes, sounds, animations) plus the
+    .ini config files. There are no executables, no source code and no
+    scripts inside the pak.
+    The Blueprint assets that look relevant to the server are tiny and contain
+    no RPC names:
+        BP/GameModeBP.uasset            12,955 bytes
+        BP/MyPlayerControllerBP.uasset   5,905 bytes
+        BP/Localization/MyGameInstanceBP.uasset 86,435 bytes
+        BP/MainMenu/MainMenuGameModeBP.uasset    2,925 bytes
+        BP/SkinEditorGameModeBP.uasset           2,644 bytes
+    A regex over these files for names starting with Server, Client,
+    Multicast or OnRep returned nothing (only "MulticastDelegateProperty" in
+    MyGameInstanceBP). The Blueprint classes are thin layers over native
+    classes; the networked behaviour is compiled code inside libUE4.so.
+
+13.4 Config files (SpecialForces/Config/DefaultEngine.ini)
+    [/Script/MySettings]  (a game-specific settings object, including values
+    for a dedicated server)
+        PlayerName=DedicServer1
+        MaxPlayers=16, BotCount=2, TimeRound=180, CountRoundVote=15
+        AddMoneyRound=2000, AutoBalance=True, CanChangeMode=True
+        PublicServer=0, GameMode=0, PasswordInCreateRoom=0
+        DefaultSelectMasterServer=0
+        IpMasterMasterServer1=43.249.37.193
+        IpMasterMasterServer2=198.44.48.154
+        IpMasterMasterServer3=85.25.194.37
+        IpMasterMasterServer4=43.249.37.193
+        PortMasterMasterServer=7600
+    [/Script/OnlineSubsystemUtils.IpNetDriver]
+        MaxClientRate=150000, MaxInternetClientRate=100000
+    [/Script/Engine.Player]
+        ConfiguredInternetSpeed=100000, ConfiguredLanSpeed=150000
+    [/Script/EngineSettings.GameMapsSettings]
+        GameInstanceClass=/Game/MyContent/BP/Localization/MyGameInstanceBP.MyGameInstanceBP_C
+        GameDefaultMap=/Game/MyContent/MapsNotPlay/MainMenu.MainMenu
+        ServerDefaultMap=/Game/MyContent/Maps/Desert4
+        TransitionMap=/Game/MyContent/MapsNotPlay/TransMap.TransMap
+        GlobalDefaultGameMode=/Game/MyContent/BP/GameModeBP.GameModeBP_C
+        GlobalDefaultServerGameMode=/Game/MyContent/BP/GameModeBP.GameModeBP_C
+    [/Script/Engine.Engine] class redirects:
+        TP_FirstPersonGameMode -> SpecialForcesGameMode
+        TP_FirstPersonCharacter -> SpecialForcesCharacter
+        TP_FirstPersonProjectile -> SpecialForcesProjectile
+        TP_FirstPersonHUD -> SpecialForcesHUD
+    [Voice] bEnabled=true     [OnlineSubsystem] DefaultPlatformService=Null
+    There are NO connection timeout settings (no ConnectionTimeout,
+    InitialConnectTimeout): the engine defaults apply.
+
+    DefaultGame.ini:
+        [/Script/Engine.GameSession]  MaxPlayers=16
+        [/Script/Engine.GameNetworkManager]
+            ClientAuthorativePosition=True        (player position comes from
+                                                   the client)
+            bMovementTimeDiscrepancyDetection=True, ...Resolution=True
+            MovementTimeDiscrepancyMaxTimeMargin=0.925, MinTimeMargin=-0.925
+            MovementTimeDiscrepancyResolutionRate=1.0
+            MovementTimeDiscrepancyDriftAllowance=0.39
+            MAXPOSITIONERRORSQUARED=6.0
+            TotalNetBandwidth=640000, MaxDynamicBandwidth=70000,
+            MinDynamicBandwidth=40000
+        [ProjectSettings] ProjectName=SpecialForcesGroup2
+        [/Script/EngineSettings.GeneralProjectSettings]
+            CompanyName=ForgeGames, ProjectVersion=4.3,
+            Description="First Person Shooter"
+        Packaging section: BuildConfiguration=PPBC_Shipping, many cultures
+        staged (en, ru, es, de, fr, zh, pt, ja, id, tr and regional variants).
+        (The same section contains the line UsePakFile=False as written in the
+        file; the shipped game nevertheless loads its content from the pak.)
+
+13.5 libUE4.so (armeabi-v7a) string extraction
+        L=~/extractedApk/lib/armeabi-v7a/libUE4.so
+        strings -n 5 "$L" > ~/ue4_strings.txt                # 59,288 lines
+        grep -E "^(Server|Client|Multicast)[A-Z][A-Za-z0-9_]{2,}$" ~/ue4_strings.txt \
+             | sort -u > ~/rpc_names.txt                     # 189 names
+        grep -i -E "DedicServer|MasterServer|RegistrationServer|IamServer|OKRegister|PublicServer|CountRoundVote|SpecialForcesGameMode|SpecialForcesCharacter" \
+             ~/ue4_strings.txt | sort -u
+    Matches found:
+        _Function_=RegistrationServerHub~_Data_=
+        _Function_=RegistrationServerWhite~_Data_=       (a second registration
+                                                          function, "White")
+        OKRegisterHub, GetListMasterServer, GetMasterServersList,
+        ListMasterServer, MasterServer, MasterServerIP, MasterServerName,
+        MasterServers, MasterMasterServerHost, SelectMasterServer,
+        LastSelectMasterServer, numSelectMasterServer, DefaultSelectMasterServer,
+        iMasterServer, PublicServer, CountRoundVote
+    The names DedicServer, IamServer, SpecialForcesGameMode and
+    SpecialForcesCharacter were not found as plain strings.
+    The strings also show native RPC-style functions with validation, for
+    example BlockShieldServer / BlockShieldServer_Validate, and engine items
+    such as APIServerET, AServerStatReplicator, "Core.ServerNetConn".
+    rpc_names.txt (189 Server/Client/Multicast names) has been produced; it
+    has not yet been mapped to function addresses.
+
+================================================================================
+ 14. WHERE WE STOPPED (OBSERVED FACTS)
+================================================================================
+Working and verified:
+  - Registration: the server appears in the in-game list (Russia origin), with
+    name, map, player counts, mode, empty password.
+  - Relay: all five relay endpoints open and deliver player packets.
+  - UE4 stateless handshake, Hello -> Challenge, Login -> Welcome, and
+    reception of Netspeed and Join. The game loads the map named in the
+    Welcome (Desert).
+  - Replay of a recorded host session: the client loads the whole map, shows
+    the team-selection screen, and shows the recorded characters, player list
+    and chat messages. Our server acknowledges every packet.
+
+Observed behaviour at the stopping point:
+  1. In every run the client sends a Close bunch (ends ff0500c0) 4.0 to 6.8
+     seconds after the Welcome and the game returns to the menu.
+  2. In the real recorded session the client starts sending reliable bunches
+     on channel 2 about 0.34 s after the host's first burst (packets of 951,
+     479 and 263 bytes with ChSequence 273, 275, 277 for a client base of
+     272). In our runs the client sends nothing but 10-byte acks and the
+     final Close; no reliable bunch on channel 2 has ever been received.
+  3. In one run (rain5) the client's last control-channel ChSequence was 882
+     for the Close, i.e. exactly Join + 1: no other reliable control message
+     was sent between Join and Close.
+  4. In one run the replay was never started (Join size did not match) and the
+     client still closed 5.3 s after the Welcome.
+  5. In rain5 the client's ack history reported 5 of the first 27 replayed
+     packets as not received (server seq 15892, 15894, 15899, 15903, 15908;
+     sizes 206, 362, 202, 30 and 354 bytes). Our server sends each replay
+     packet once and does not retransmit.
+  6. The pak configuration defines no network timeouts.
+  7. The server has no game state: it does not react to anything the player
+     does (movement, team choice, weapons).
+
+================================================================================
+ 15. PRIMARY OBJECTIVE: MAKE THE GAME PLAYABLE BY EMULATING THE SERVER
+================================================================================
+THE GOAL
+  Make Special Forces Group 2 playable again on a server that we control. A
+  player opens the unmodified game, picks our server in the in-game list,
+  joins, chooses a team, spawns, moves, shoots, takes damage, captures flags,
+  plays complete rounds with real score, voting and chat, and finishes the
+  match - with other real players on the same server and administrators able
+  to run commands (kick, mute, ban).
+  The developers have stopped supporting the game and do not answer players,
+  so there is no official server software, source code or documentation. The
+  server must be re-created from what the game itself reveals.
+
+THE APPROACH: SERVER EMULATION
+  We emulate the dedicated server. The program must speak exactly what the real
+  host speaks:
+    (1) hub registration, ping and relay handling ......... DONE (section 10-11)
+    (2) UE4 stateless handshake ........................... DONE
+    (3) control channel: Hello, Challenge, Login, Welcome,
+        Netspeed, Join ..................................... DONE
+    (4) UE4 replication: after the Join the server must create the
+        PlayerController, PlayerState, GameState and the player's pawn, open
+        and update the actor channels (2, 3, 8, 11 ... in the recorded
+        session), answer the client's RPCs, and keep the world state
+        consistent for every player ................ NOT DONE - this is the
+        core of the project
+    (5) the match rules: rounds, teams, flags, bomb, score, economy, voting,
+        bots, chat, admin commands .......................... NOT DONE
+
+WHERE THE GAME LOGIC LIVES
+  All of the game's rules and networking behaviour are native code inside
+  libUE4.so. UE4's Android packaging compiles the engine and the game module
+  (SpecialForcesGameMode, SpecialForcesCharacter, SpecialForcesProjectile,
+  SpecialForcesHUD and the custom game classes) into this one shared object.
+  The Blueprint assets in the pak contain no RPC names and no rules (section
+  13), and the pak holds no code. The server's behaviour must therefore be
+  recovered from libUE4.so (static analysis with Ghidra / radare2) together
+  with what we observe on the wire.
+
+KNOWN ADDRESSES IN libUE4.so  (arm64-v8a build from the APK, no symbols;
+ radare2 addresses; Ghidra address = radare2 address + 0x100000)
+    0x010a4844  native thunk of the UFunction RegisterServer
+                (UFunction table slot 0x041f6780, name string at 0x033ce40b)
+    0x0101e550  implementation behind RegisterServer: periodic availability /
+                ping routine (clock_gettime, about every 10 s, message
+                "ERROR PING NOT RESPOND"), calls 0x0101afe4
+    0x0101afe4  function using the format "http://%s:%s"; reads an element of
+                the InternetServers array (88-byte records, text at +0x20)
+    0x0101c3ec  AddServers: parses the server-list text, split on '~'
+                (Ghidra FUN_0111c3ec; separator literal at 0x034fdcf8; split
+                helper at Ghidra 0x0122d5dc)
+    0x0101b60c  hub-message handler: splits on ';' (literal 0x035ffc1a),
+                compares the function field with "JoinServer" (0x034ce6d7)
+                and the status with "OK" (0x03788b91) / "ERROR" (0x036d1ddb)
+                (Ghidra FUN_0111b60c)
+    0x033c6000-0x033c6200  UTF-16 string pool with GetListMasterServer,
+                the legacy master URL, AddServers, GetServers, GetAllServers,
+                GetPasswords, RegistrationServerWhite, RegistrationServerHub,
+                "SERVER DOES NOT RESPOND", "ERROR PING NOT RESPOND", ";!Pass="
+    These functions cover the server list, registration and join only. The
+    addresses of the in-match functions (player spawn, movement RPC handling,
+    damage, flag and bomb logic, round and score handling, voting, chat and
+    admin commands) have not been located yet. The reflection table that holds
+    the game's UFunction and variable names (JoinServerNew, RegisterServer,
+    GetUniqueID, NewVersion, SetAllKillsPlayers, SetAllDeadsPlayers,
+    GetScoreKills, GetScoreSniper, InternetServers, MasterServers, _GameMode,
+    MaxPing, CountPing, PublicServer, CountRoundVote, BombAllMaps, ...) and the
+    189 Server/Client/Multicast names in rpc_names.txt (armeabi-v7a build)
+    are the starting inventory of the game's own code. The armeabi-v7a
+    libUE4.so is a separate binary with its own addresses; none of its
+    addresses have been analyzed.
+
+THE nagoory PRECEDENT
+  nagoory proves that this is achievable. He analyzed the game, built his own
+  dedicated server (written in C), hosted it on a German cloud provider
+  (2.56.246.77:17092, room "nagoory-dedicated"), and it is listed in the
+  game's server list and joined by real players through the stock game (the
+  captured JoinServer exchange for his room is in section 9.1). His server
+  runs real matches and has admin commands (!kick, mute, ban) with
+  server-side permission checks. He has not shared how he built it. He told
+  the project owner that libUE4.so and the .pak are important, and that he
+  used libUE4.so to obtain the UDP information.
+
+WHAT THE PAK ANALYSIS ESTABLISHED
+  After the AES-256 key was obtained, the pak was fully decrypted and
+  listed (439 folders). It consists of cooked .uasset assets (Blueprints,
+  meshes, textures, sounds, animations) and .ini configuration. It contains
+  no programs and no source code, and the Blueprints contain no server
+  logic. The pak confirms the maps, weapons, classes and the dedicated-server
+  settings object ([/Script/MySettings] with DedicServer1, MaxPlayers=16,
+  BotCount=2, TimeRound=180, CountRoundVote=15, PublicServer, GameMode,
+  AutoBalance), but the server's code is not in it.
+
+STATE OF THE PROJECT IN ONE PARAGRAPH
+  A server written by us registers in the real hub, appears in the game's
+  list, accepts a real player through the relay, completes the UE4 handshake,
+  login and welcome exchange, receives Netspeed and Join, and feeds the player
+  a recorded session that loads the full map and team-selection screen. The
+  game logic that would keep that player in a live match - the server-side
+  replication of the player, the world and the rules - is the unsolved part,
+  and it is exactly the code that lives inside libUE4.so.
+
+================================================================================
+ END OF DOCUMENT
+================================================================================

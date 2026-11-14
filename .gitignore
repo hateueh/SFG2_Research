@@ -1,0 +1,11 @@
+# Generated from real captures — never commit these
+scripts/welcome_body.bin
+scripts/replay.bin
+*.pcap
+*.pcapng
+*.pak
+*.so
+__pycache__/
+*.pyc
+.ghidra_*
+*.log
